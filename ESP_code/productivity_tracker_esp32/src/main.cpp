@@ -3,7 +3,7 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
-#include <driver/rmt.h>
+#include <SPI.h>
 
 // Web Interface HTML
 const char index_html[] PROGMEM = R"rawliteral(
@@ -197,21 +197,13 @@ const char index_html[] PROGMEM = R"rawliteral(
 const char* ssid = "Major Tom";
 const char* password = "groundcontrol";
 
-#define LED_PIN         GPIO_NUM_12  // Changed to proper GPIO type
-#define NUM_LEDS        84
-#define RMT_CHANNEL     RMT_CHANNEL_0  // Changed to proper RMT type
-#define CHUNK_SIZE      28
-
-// Power Management
+// Pin Definitions
+#define DATA_PIN    23  // MOSI (DI on LED strip)
+#define CLOCK_PIN   18  // SCK  (CI on LED strip)
+#define NUM_LEDS    84
 #define MAX_BRIGHTNESS  255
 #define DEFAULT_BRIGHTNESS 128
 
-// LED timing for BL-HBGR32L-3-TRB-8
-#define T0H             350
-#define T0L             900
-#define T1H             900
-#define T1L             350
-#define RESET_TIME      80
 
 struct LED {
     uint8_t red;
@@ -226,52 +218,27 @@ uint8_t globalBrightness = DEFAULT_BRIGHTNESS;
 AsyncWebServer server(80);
 
 void sendLEDs() {
-    size_t rmtItems = CHUNK_SIZE * 24;
-    rmt_item32_t* items = (rmt_item32_t*)malloc(sizeof(rmt_item32_t) * rmtItems);
+    // Start frame
+    SPI.transfer(0x00);
+    SPI.transfer(0x00);
+    SPI.transfer(0x00);
+    SPI.transfer(0x00);
     
-    if (!items) {
-        Serial.println("Failed to allocate memory");
-        return;
+    // LED data
+    for(int i = 0; i < NUM_LEDS; i++) {
+        uint8_t brightness = ((uint16_t)leds[i].brightness * globalBrightness) >> 8;
+        
+        // LED frame: 111XXXXX (brightness)
+        SPI.transfer(0xE0 | (brightness >> 3));
+        SPI.transfer(leds[i].blue);
+        SPI.transfer(leds[i].green);
+        SPI.transfer(leds[i].red);
     }
     
-    for (int ledStart = 0; ledStart < NUM_LEDS; ledStart += CHUNK_SIZE) {
-        int chunkSize = (ledStart + CHUNK_SIZE > NUM_LEDS) ? (NUM_LEDS - ledStart) : CHUNK_SIZE;
-        size_t itemIndex = 0;
-        
-        for (int i = ledStart; i < ledStart + chunkSize; i++) {
-            // Apply brightness scaling
-            uint8_t r = (uint16_t(leds[i].red) * leds[i].brightness) >> 8;
-            uint8_t g = (uint16_t(leds[i].green) * leds[i].brightness) >> 8;
-            uint8_t b = (uint16_t(leds[i].blue) * leds[i].brightness) >> 8;
-            
-            // Apply global brightness
-            r = (uint16_t(r) * globalBrightness) >> 8;
-            g = (uint16_t(g) * globalBrightness) >> 8;
-            b = (uint16_t(b) * globalBrightness) >> 8;
-            
-            uint32_t grb = (g << 16) | (r << 8) | b;
-            
-            for (int bit = 23; bit >= 0; bit--) {
-                if (grb & (1 << bit)) {
-                    items[itemIndex].level0 = 1;
-                    items[itemIndex].duration0 = T1H / 25;
-                    items[itemIndex].level1 = 0;
-                    items[itemIndex].duration1 = T1L / 25;
-                } else {
-                    items[itemIndex].level0 = 1;
-                    items[itemIndex].duration0 = T0H / 25;
-                    items[itemIndex].level1 = 0;
-                    items[itemIndex].duration1 = T0L / 25;
-                }
-                itemIndex++;
-            }
-        }
-        
-        rmt_write_items(RMT_CHANNEL_0, items, chunkSize * 24, true);
+    // End frame
+    for(int i = 0; i < (NUM_LEDS + 15) / 16; i++) {
+        SPI.transfer(0xFF);
     }
-    
-    free(items);
-    delayMicroseconds(RESET_TIME);
 }
 
 void setup() {
@@ -281,21 +248,6 @@ void setup() {
     for (int i = 0; i < NUM_LEDS; i++) {
         leds[i] = {0, 0, 0, MAX_BRIGHTNESS};
     }
-    
-    // Setup RMT
-    rmt_config_t config = {};
-    config.rmt_mode = RMT_MODE_TX;
-    config.channel = RMT_CHANNEL_0;
-    config.gpio_num = LED_PIN;
-    config.mem_block_num = 1;
-    config.tx_config.loop_en = false;
-    config.tx_config.carrier_en = false;
-    config.tx_config.idle_output_en = true;
-    config.tx_config.idle_level = RMT_IDLE_LEVEL_LOW;
-    config.clk_div = 2;
-
-    rmt_config(&config);
-    rmt_driver_install(config.channel, 0, 0);
     
     // Connect to WiFi
     WiFi.begin(ssid, password);
@@ -419,6 +371,8 @@ void setup() {
     });
     
     server.begin();
+
+    sendLEDs();
 }
 
 void loop() {
