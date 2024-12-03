@@ -4,8 +4,33 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include <SPI.h>
+#include <SPIFFS.h>
 
-// Web Interface HTML
+// Pin Definitions
+#define DATA_PIN    23  // MOSI (DI on LED strip)
+#define CLOCK_PIN   18  // SCK  (CI on LED strip)
+#define NUM_LEDS    84
+#define MAX_BRIGHTNESS  255
+#define DEFAULT_BRIGHTNESS 128
+
+// WiFi Configuration
+const char* ssid = "Major Tom";
+const char* password = "groundcontrol";
+
+// Data structure for each LED
+struct LED {
+    uint8_t red;
+    uint8_t green;
+    uint8_t blue;
+    uint8_t brightness;
+} leds[NUM_LEDS];
+
+// Global brightness control
+uint8_t globalBrightness = DEFAULT_BRIGHTNESS;
+
+AsyncWebServer server(80);
+
+// Web Interface HTML - stored in program memory
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -78,12 +103,22 @@ const char index_html[] PROGMEM = R"rawliteral(
         button.clear:hover {
             background: #d32f2f;
         }
+        #response {
+            font-family: monospace;
+            white-space: pre-wrap;
+            background: #eee;
+            padding: 10px;
+            border-radius: 4px;
+            margin-top: 10px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="card">
-            <h2>LED Control</h2>
+            <h2>LED Control Interface</h2>
             <div class="led-grid" id="ledGrid"></div>
             <div class="controls">
                 <div>
@@ -100,6 +135,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <button id="applyAllButton">Apply to All</button>
                 <button id="clearButton" class="clear">Clear All</button>
             </div>
+            <div id="response"></div>
         </div>
     </div>
 
@@ -107,24 +143,68 @@ const char index_html[] PROGMEM = R"rawliteral(
         const NUM_LEDS = 84;
         let selectedLeds = new Set();
         
-        // Initialize LED grid
+        function getPhysicalLedIndex(visualIndex) {
+            const row = Math.floor(visualIndex / 12);
+            const col = visualIndex % 12;
+            return col * 7 + row;
+        }
+        
+        // Initialize LED grid with physical mapping
         const ledGrid = document.getElementById('ledGrid');
         for (let i = 0; i < NUM_LEDS; i++) {
             const led = document.createElement('div');
             led.className = 'led';
             led.style.backgroundColor = '#000000';
-            led.dataset.index = i;
-            led.addEventListener('click', () => toggleLed(i));
+            
+            const physicalIndex = getPhysicalLedIndex(i);
+            led.dataset.index = physicalIndex;
+            led.title = `LED ${physicalIndex + 1}`;
+            
+            led.addEventListener('click', () => toggleLed(physicalIndex));
             ledGrid.appendChild(led);
         }
 
-        function toggleLed(index) {
-            const led = ledGrid.children[index];
-            if (selectedLeds.has(index)) {
-                selectedLeds.delete(index);
+        async function updateResponse(message) {
+            const responseArea = document.getElementById('response');
+            responseArea.textContent = typeof message === 'string' ? message : JSON.stringify(message, null, 2);
+            responseArea.scrollTop = responseArea.scrollHeight;
+        }
+
+        async function fetchStatus() {
+            try {
+                const response = await fetch('/status');
+                const data = await response.json();
+                
+                // Create a mapping from physical index to grid element
+                const gridElements = Array.from(ledGrid.children);
+                
+                data.leds.forEach(led => {
+                    const element = gridElements.find(el => 
+                        parseInt(el.dataset.index) === led.index
+                    );
+                    if (element) {
+                        element.style.backgroundColor = 
+                            `rgb(${led.red},${led.green},${led.blue})`;
+                    }
+                });
+                updateResponse("Status updated successfully");
+            } catch (error) {
+                updateResponse("Error fetching status: " + error.message);
+            }
+        }
+
+        function toggleLed(physicalIndex) {
+            const led = Array.from(ledGrid.children).find(
+                element => parseInt(element.dataset.index) === physicalIndex
+            );
+            
+            if (!led) return;
+            
+            if (selectedLeds.has(physicalIndex)) {
+                selectedLeds.delete(physicalIndex);
                 led.classList.remove('active');
             } else {
-                selectedLeds.add(index);
+                selectedLeds.add(physicalIndex);
                 led.classList.add('active');
             }
         }
@@ -141,94 +221,107 @@ const char index_html[] PROGMEM = R"rawliteral(
         }
 
         document.getElementById('applyButton').addEventListener('click', async () => {
+            if (selectedLeds.size === 0) {
+                updateResponse("No LEDs selected");
+                return;
+            }
+
             const color = getColorValues();
-            for (const index of selectedLeds) {
-                try {
-                    await fetch('/led', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ index, ...color })
+            const updates = Array.from(selectedLeds).map(index => ({
+                index,
+                ...color
+            }));
+
+            try {
+                const response = await fetch('/batch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ leds: updates })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    updates.forEach(update => {
+                        const led = Array.from(ledGrid.children).find(
+                            el => parseInt(el.dataset.index) === update.index
+                        );
+                        if (led) {
+                            led.style.backgroundColor = 
+                                `rgb(${color.red},${color.green},${color.blue})`;
+                        }
                     });
-                    ledGrid.children[index].style.backgroundColor = 
-                        `rgb(${color.red},${color.green},${color.blue})`;
-                } catch (error) {
-                    console.error('Error:', error);
                 }
+                
+                updateResponse(result);
+            } catch (error) {
+                updateResponse("Error: " + error.message);
             }
         });
 
         document.getElementById('applyAllButton').addEventListener('click', async () => {
             const color = getColorValues();
             try {
-                await fetch('/all', {
+                const response = await fetch('/all', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(color)
                 });
-                Array.from(ledGrid.children).forEach(led => {
-                    led.style.backgroundColor = 
-                        `rgb(${color.red},${color.green},${color.blue})`;
-                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    Array.from(ledGrid.children).forEach(led => {
+                        led.style.backgroundColor = 
+                            `rgb(${color.red},${color.green},${color.blue})`;
+                    });
+                }
+                
+                updateResponse(result);
             } catch (error) {
-                console.error('Error:', error);
+                updateResponse("Error: " + error.message);
             }
         });
 
         document.getElementById('clearButton').addEventListener('click', async () => {
             try {
-                await fetch('/clear', { method: 'POST' });
-                Array.from(ledGrid.children).forEach(led => {
-                    led.style.backgroundColor = '#000000';
-                });
-                selectedLeds.clear();
-                Array.from(ledGrid.children).forEach(led => {
-                    led.classList.remove('active');
-                });
+                const response = await fetch('/clear', { method: 'POST' });
+                const result = await response.json();
+                
+                if (result.success) {
+                    Array.from(ledGrid.children).forEach(led => {
+                        led.style.backgroundColor = '#000000';
+                    });
+                    selectedLeds.clear();
+                    Array.from(ledGrid.children).forEach(led => {
+                        led.classList.remove('active');
+                    });
+                }
+                
+                updateResponse(result);
             } catch (error) {
-                console.error('Error:', error);
+                updateResponse("Error: " + error.message);
             }
         });
+
+        // Load initial state
+        fetchStatus();
     </script>
 </body>
 </html>
 )rawliteral";
 
-// Configuration
-const char* ssid = "Major Tom";
-const char* password = "groundcontrol";
-
-// Pin Definitions
-#define DATA_PIN    23  // MOSI (DI on LED strip)
-#define CLOCK_PIN   18  // SCK  (CI on LED strip)
-#define NUM_LEDS    84
-#define MAX_BRIGHTNESS  255
-#define DEFAULT_BRIGHTNESS 128
-
-
-struct LED {
-    uint8_t red;
-    uint8_t green;
-    uint8_t blue;
-    uint8_t brightness;
-} leds[NUM_LEDS];
-
-// Global brightness control
-uint8_t globalBrightness = DEFAULT_BRIGHTNESS;
-
-AsyncWebServer server(80);
-
 void sendLEDs() {
+    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    
     // Start frame
-    SPI.transfer(0x00);
-    SPI.transfer(0x00);
-    SPI.transfer(0x00);
-    SPI.transfer(0x00);
+    for (int i = 0; i < 4; i++) {
+        SPI.transfer(0x00);
+    }
     
     // LED data
     for(int i = 0; i < NUM_LEDS; i++) {
         uint8_t brightness = ((uint16_t)leds[i].brightness * globalBrightness) >> 8;
-        
-        // LED frame: 111XXXXX (brightness)
         SPI.transfer(0xE0 | (brightness >> 3));
         SPI.transfer(leds[i].blue);
         SPI.transfer(leds[i].green);
@@ -239,15 +332,23 @@ void sendLEDs() {
     for(int i = 0; i < (NUM_LEDS + 15) / 16; i++) {
         SPI.transfer(0xFF);
     }
+    
+    SPI.endTransaction();
 }
 
 void setup() {
     Serial.begin(115200);
     
+    // Initialize SPI
+    SPI.begin(CLOCK_PIN, -1, DATA_PIN, -1);
+    
     // Initialize LED array
     for (int i = 0; i < NUM_LEDS; i++) {
         leds[i] = {0, 0, 0, MAX_BRIGHTNESS};
     }
+    
+    // Initial LED update to ensure all are off
+    sendLEDs();
     
     // Connect to WiFi
     WiFi.begin(ssid, password);
@@ -257,14 +358,19 @@ void setup() {
     }
     Serial.println(WiFi.localIP());
 
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    // CORS headers
+    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
+    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "Content-Type");
+
+    // Serve web interface
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
         request->send_P(200, "text/html", index_html);
     });
-    
-    // API endpoints
-    // Get current LED states
+
+    // Get LED status
     server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
-        DynamicJsonDocument doc(1024);
+        DynamicJsonDocument doc(2048);
         JsonArray ledArray = doc.createNestedArray("leds");
         
         for(int i = 0; i < NUM_LEDS; i++) {
@@ -281,7 +387,7 @@ void setup() {
         request->send(200, "application/json", response);
     });
 
-    // Single LED control endpoint
+    // Set individual LED
     server.on("/led", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
         [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
             DynamicJsonDocument doc(256);
@@ -292,14 +398,12 @@ void setup() {
                 return;
             }
 
-            // Get LED index and verify it's valid
             int ledIndex = doc["index"] | -1;
             if (ledIndex < 0 || ledIndex >= NUM_LEDS) {
                 request->send(400, "application/json", "{\"error\": \"Invalid LED index\"}");
                 return;
             }
 
-            // Update LED values
             leds[ledIndex].red = doc["red"] | 0;
             leds[ledIndex].green = doc["green"] | 0;
             leds[ledIndex].blue = doc["blue"] | 0;
@@ -309,7 +413,39 @@ void setup() {
             request->send(200, "application/json", "{\"success\": true}");
     });
 
-    // Control all LEDs at once
+    // Batch update multiple LEDs
+    server.on("/batch", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
+        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+            DynamicJsonDocument doc(2048);
+            DeserializationError error = deserializeJson(doc, (const char*)data);
+            
+            if (error) {
+                request->send(400, "application/json", "{\"error\": \"Invalid JSON\"}");
+                return;
+            }
+
+            JsonArray ledUpdates = doc["leds"];
+            if (!ledUpdates || ledUpdates.size() == 0) {
+                request->send(400, "application/json", "{\"error\": \"Missing or empty leds array\"}");
+                return;
+            }
+
+            for (JsonObject update : ledUpdates) {
+                int ledIndex = update["index"] | -1;
+                if (ledIndex >= 0 && ledIndex < NUM_LEDS) {
+                    leds[ledIndex].red = update["red"] | 0;
+                    leds[ledIndex].green = update["green"] | 0;
+                    leds[ledIndex].blue = update["blue"] | 0;
+                    leds[ledIndex].brightness = update["brightness"] | MAX_BRIGHTNESS;
+                }
+            }
+
+            // Update all LEDs at once after collecting changes
+            sendLEDs();
+            request->send(200, "application/json", "{\"success\": true}");
+    });
+
+    // Set all LEDs to same color
     server.on("/all", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
         [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
             DynamicJsonDocument doc(256);
@@ -320,13 +456,11 @@ void setup() {
                 return;
             }
 
-            // Get color values with defaults
             uint8_t red = doc["red"] | 0;
             uint8_t green = doc["green"] | 0;
             uint8_t blue = doc["blue"] | 0;
             uint8_t brightness = doc["brightness"] | MAX_BRIGHTNESS;
 
-            // Update all LEDs
             for (int i = 0; i < NUM_LEDS; i++) {
                 leds[i].red = red;
                 leds[i].green = green;
@@ -338,7 +472,7 @@ void setup() {
             request->send(200, "application/json", "{\"success\": true}");
     });
 
-    // Clear all LEDs (turn them off)
+    // Clear all LEDs
     server.on("/clear", HTTP_POST, [](AsyncWebServerRequest *request) {
         for (int i = 0; i < NUM_LEDS; i++) {
             leds[i] = {0, 0, 0, MAX_BRIGHTNESS};
@@ -347,34 +481,9 @@ void setup() {
         request->send(200, "application/json", "{\"success\": true}");
     });
 
-    // Global brightness control
-    server.on("/brightness", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
-        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-            DynamicJsonDocument doc(64);
-            DeserializationError error = deserializeJson(doc, (const char*)data);
-            
-            if (error) {
-                request->send(400, "application/json", "{\"error\": \"Invalid JSON\"}");
-                return;
-            }
-
-            if (!doc.containsKey("brightness")) {
-                request->send(400, "application/json", "{\"error\": \"Missing brightness value\"}");
-                return;
-            }
-
-            uint8_t newBrightness = doc["brightness"] | DEFAULT_BRIGHTNESS;
-            globalBrightness = (newBrightness > MAX_BRIGHTNESS) ? MAX_BRIGHTNESS : newBrightness;
-            
-            sendLEDs();
-            request->send(200, "application/json", "{\"success\": true}");
-    });
-    
     server.begin();
-
-    sendLEDs();
 }
 
 void loop() {
-    delay(10);
+    delay(10);  // Small delay to prevent watchdog timer issues
 }
